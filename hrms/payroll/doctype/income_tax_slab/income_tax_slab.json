@@ -13,6 +13,7 @@
   "column_break_3",
   "currency",
   "standard_tax_exemption_amount",
+  "position_allowance",
   "allow_tax_exemption",
   "amended_from",
   "taxable_salary_slabs_section",
@@ -71,8 +72,16 @@
    "fieldname": "standard_tax_exemption_amount",
    "fieldtype": "Currency",
    "label": "Standard Tax Exemption Amount",
+   "reqd": 1,
    "options": "currency"
   },
+  {
+    "fieldname": "position_allowance",
+    "fieldtype": "Percent",
+    "in_list_view": 1,
+    "reqd": 1,
+    "label": "Position Allowance (Biaya Jabatan)"
+  }, 
   {
    "fieldname": "company",
    "fieldtype": "Link",

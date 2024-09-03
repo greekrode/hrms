@@ -419,7 +419,7 @@ class SalarySlip(TransactionBase):
 
 		daily_wages_fraction_for_half_day = flt(payroll_settings.daily_wages_fraction_for_half_day) or 0.5
 
-		working_days = date_diff(self.end_date, self.start_date) + 1
+		working_days = 25
 		if for_preview:
 			self.total_working_days = working_days
 			self.payment_days = working_days
@@ -450,15 +450,15 @@ class SalarySlip(TransactionBase):
 
 		if not lwp:
 			lwp = actual_lwp
-		elif lwp != actual_lwp:
-			frappe.msgprint(
-				_("Leave Without Pay does not match with approved {} records").format(
-					payroll_settings.payroll_based_on
-				)
-			)
+		# elif lwp != actual_lwp:
+		# 	frappe.msgprint(
+		# 		_("Leave Without Pay does not match with approved {} records").format(
+		# 			payroll_settings.payroll_based_on
+		# 		)
+		# 	)
 
 		self.leave_without_pay = lwp
-		self.total_working_days = working_days
+		self.total_working_days = 25
 
 		payment_days = self.get_payment_days(payroll_settings.include_holidays_in_total_working_days)
 
@@ -822,6 +822,9 @@ class SalarySlip(TransactionBase):
 		# Employee Other Incomes
 		self.other_incomes = self.get_income_form_other_sources() or 0.0
 
+		# Position Allowance
+		self.position_allowance = (self.get_position_allowance() * 12) or 0.0
+
 		# Total taxable earnings including additional and other incomes
 		self.total_taxable_earnings = (
 			self.previous_taxable_earnings
@@ -831,6 +834,7 @@ class SalarySlip(TransactionBase):
 			+ self.other_incomes
 			+ self.unclaimed_taxable_benefits
 			- self.total_exemption_amount
+			- self.position_allowance
 		)
 
 		# Total taxable earnings without additional earnings with full tax
@@ -904,6 +908,7 @@ class SalarySlip(TransactionBase):
 			+ self.deductions_before_tax_calculation
 			+ self.tax_exemption_declaration
 			+ self.standard_tax_exemption_amount
+			+ self.position_allowance
 		)
 
 		self.income_tax_deducted_till_date = self.get_income_tax_deducted_till_date()
@@ -1069,11 +1074,42 @@ class SalarySlip(TransactionBase):
 		self.data, self.default_data = self.get_data_for_eval()
 		timesheet_component = self._salary_structure_doc.salary_component
 
-		for struct_row in self._salary_structure_doc.get(component_type):
+		salary_structure_doc = self._salary_structure_doc.get(component_type)
+
+		if component_type == "deductions":
+			deductions = self._salary_structure_doc.get('deductions', [])
+
+			# Find the target SalaryDetail and its index
+			target_index = None
+			for index, salary_detail in enumerate(deductions):
+				if salary_detail.salary_component == "Piutang Karyawan":
+					target_index = index
+					break
+
+			# If the target SalaryDetail is found, move it to the end of the list
+			if target_index is not None:
+				target_salary_detail = deductions.pop(target_index)
+				deductions.append(target_salary_detail)
+
+			salary_structure_doc = deductions
+
+		for struct_row in salary_structure_doc:
 			if self.salary_slip_based_on_timesheet and struct_row.salary_component == timesheet_component:
 				continue
 
-			amount = self.eval_condition_and_formula(struct_row, self.data)
+			current_component = self.get(struct_row.parentfield)
+			amount = 0.0  # Default value
+			abbr_found = False  # Flag to track if a matching abbr is found
+
+			for cc in current_component:
+				if cc.get("abbr") == struct_row.abbr and not struct_row.amount_based_on_formula:
+					amount = cc.get("amount")
+					abbr_found = True
+					break  # Exit loop after finding the match
+
+			if not abbr_found:
+				amount = self.eval_condition_and_formula(struct_row, self.data)
+
 			if struct_row.statistical_component:
 				# update statitical component amount in reference data based on payment days
 				# since row for statistical component is not added to salary slip
@@ -1086,7 +1122,6 @@ class SalarySlip(TransactionBase):
 						else 0
 					)
 					self.data[struct_row.abbr] = flt(payment_days_amount, struct_row.precision("amount"))
-
 			else:
 				# default behavior, the system does not add if component amount is zero
 				# if remove_if_zero_valued is unchecked, then ask system to add component row
@@ -1101,7 +1136,7 @@ class SalarySlip(TransactionBase):
 					or (struct_row.amount_based_on_formula and amount is not None)
 					or (not remove_if_zero_valued and amount is not None and not self.data[struct_row.abbr])
 				):
-					default_amount = self.eval_condition_and_formula(struct_row, self.default_data)
+					default_amount = amount
 					self.update_component_row(
 						struct_row,
 						amount,
@@ -1151,12 +1186,75 @@ class SalarySlip(TransactionBase):
 				if not _safe_eval(condition, self.whitelisted_globals, data):
 					return None
 			amount = struct_row.amount
+			
 			if struct_row.amount_based_on_formula:
 				formula = sanitize_expression(struct_row.formula)
 				if formula:
 					amount = flt(
 						_safe_eval(formula, self.whitelisted_globals, data), struct_row.precision("amount")
 					)
+			
+			exist_salary_slip = frappe.db.sql(
+				"""
+				SELECT
+					COUNT(1) AS exist
+				FROM
+					`tabSalary Slip` ss
+				WHERE
+					ss.name = %s;
+				""", data.name, as_dict=True
+			)
+			
+			if struct_row.salary_component == "Piutang Karyawan" and exist_salary_slip[0]['exist'] == 0:
+				default_company = frappe.defaults.get_user_default("Company")
+
+				piutang_karyawan_account = frappe.get_cached_value(
+					"Company", default_company, "default_piutang_karyawan_account"
+				)
+
+				piutang_karyawan = frappe.db.sql(
+					"""
+					SELECT
+						(
+							total_piutang_data.total_piutang - COALESCE(deducted_piutang_data.deducted_piutang, 0)
+						) AS net_receivable
+					FROM
+						(
+							SELECT
+								ge.party,
+								SUM(ge.debit) as total_piutang
+							FROM
+								`tabGL Entry` ge
+							WHERE
+								ge.account = %s
+								AND ge.party_type = 'Employee'
+								AND ge.docstatus = 1
+								AND ge.is_cancelled != 1
+							GROUP BY
+								ge.party
+						) AS total_piutang_data
+						LEFT JOIN (
+							SELECT
+								ss.employee AS party,
+								SUM(sd.amount) AS deducted_piutang
+							FROM
+								`tabSalary Slip` ss
+								INNER JOIN `tabSalary Detail` sd ON sd.parent = ss.name
+							WHERE
+								sd.salary_component = 'Piutang Karyawan'
+								AND sd.docstatus = 1
+							GROUP BY
+								ss.employee
+						) AS deducted_piutang_data 
+							ON total_piutang_data.party = deducted_piutang_data.party
+						WHERE
+							total_piutang_data.party = %s;
+					""", piutang_karyawan_account, self.employee, as_dict=True
+				)
+				if piutang_karyawan and 'net_receivable' in piutang_karyawan[0]:
+					net_receivable = piutang_karyawan[0]['net_receivable']
+					if net_receivable > 0:
+						amount = min(net_receivable, self.gross_pay)
 			if amount:
 				data[struct_row.abbr] = amount
 
@@ -1184,6 +1282,7 @@ class SalarySlip(TransactionBase):
 				description=_("This error can be due to invalid formula or condition."),
 			)
 			raise
+
 
 	def add_employee_benefits(self):
 		for struct_row in self._salary_structure_doc.get("earnings"):
@@ -1263,13 +1362,13 @@ class SalarySlip(TransactionBase):
 
 		if self.is_new() and not tax_components:
 			tax_components = self.get_tax_components()
-			frappe.msgprint(
-				_(
-					"Added tax components from the Salary Component master as the salary structure didn't have any tax component."
-				),
-				indicator="blue",
-				alert=True,
-			)
+			# frappe.msgprint(
+			# 	_(
+			# 		"Added tax components from the Salary Component master as the salary structure didn't have any tax component."
+			# 	),
+			# 	indicator="blue",
+			# 	alert=True,
+			# )
 
 		if tax_components and self.payroll_period and self.salary_structure:
 			self.tax_slab = self.get_income_tax_slabs()
@@ -1456,16 +1555,30 @@ class SalarySlip(TransactionBase):
 
 		# Structured tax amount
 		eval_locals, default_data = self.get_data_for_eval()
-		self.total_structured_tax_amount = calculate_tax_by_tax_slab(
-			self.total_taxable_earnings_without_full_tax_addl_components,
-			self.tax_slab,
-			self.whitelisted_globals,
-			eval_locals,
-		)
+		if self.end_date_month == 12:
+			total_structured_tax_amount = calculate_tax_by_tax_slab(
+				self.total_taxable_earnings_without_full_tax_addl_components,
+				self.tax_slab,
+				self.whitelisted_globals,
+				eval_locals,
+			)
+		else:
+			total_structured_tax_amount = calculate_tax_by_tax_slab_monthly(
+				self.total_taxable_earnings_without_full_tax_addl_components,
+				self.tax_slab,
+				self.whitelisted_globals,
+				eval_locals,
+			)
 
-		self.current_structured_tax_amount = (
-			self.total_structured_tax_amount - self.previous_total_paid_taxes
-		) / self.remaining_sub_periods
+		self.total_structured_tax_amount = total_structured_tax_amount
+
+		if self.end_date_month == 12:
+				self.current_structured_tax_amount = (
+				self.total_structured_tax_amount - self.previous_total_paid_taxes
+			) / self.remaining_sub_periods
+		else:
+			self.current_structured_tax_amount = self.total_structured_tax_amount 
+			
 
 		# Total taxable earnings with additional earnings with full tax
 		self.full_tax_on_additional_earnings = 0.0
@@ -1476,8 +1589,6 @@ class SalarySlip(TransactionBase):
 			self.full_tax_on_additional_earnings = self.total_tax_amount - self.total_structured_tax_amount
 
 		current_tax_amount = self.current_structured_tax_amount + self.full_tax_on_additional_earnings
-		if flt(current_tax_amount) < 0:
-			current_tax_amount = 0
 
 		self._component_based_variable_tax[tax_component].update(
 			{
@@ -1490,6 +1601,20 @@ class SalarySlip(TransactionBase):
 		)
 
 		return current_tax_amount
+	
+	def check_npwp_tax(self, amount):
+		npwp = frappe.get_doc("Employee",self.employee).npwp
+		if not npwp:
+			return amount * 1.2
+
+		return amount
+
+	def get_position_allowance(self):
+		position_allowance = (self.tax_slab.position_allowance / 100)
+		current_earnings = self.current_structured_taxable_earnings
+		allowance = current_earnings * position_allowance
+		capped_allowance = min(allowance, 500000)
+		return capped_allowance
 
 	def get_income_tax_slabs(self):
 		income_tax_slab = self._salary_structure_assignment.income_tax_slab
@@ -1706,13 +1831,17 @@ class SalarySlip(TransactionBase):
 				or (self.relieving_date and getdate(self.end_date) > self.relieving_date)
 			)
 		):
+			lwp_custom = self.total_working_days - self.payment_days
+			total_working_days = 25
+			payment_days = abs(total_working_days - lwp_custom)
+
 			additional_amount = flt(
-				(flt(row.additional_amount) * flt(self.payment_days) / cint(self.total_working_days)),
+				(flt(row.additional_amount) * flt(payment_days) / cint(total_working_days)),
 				row.precision("additional_amount"),
 			)
 			amount = (
 				flt(
-					(flt(row.default_amount) * flt(self.payment_days) / cint(self.total_working_days)),
+					(flt(row.default_amount) * flt(payment_days) / cint(total_working_days)),
 					row.precision("amount"),
 				)
 				+ additional_amount
@@ -2121,6 +2250,21 @@ def calculate_tax_by_tax_slab(annual_taxable_earning, tax_slab, eval_globals=Non
 
 	return tax_amount
 
+def calculate_tax_by_tax_slab_monthly(
+	taxable_earning, tax_slab, eval_globals=None, eval_locals=None
+):
+	eval_locals.update({"annual_taxable_earning": taxable_earning})
+	tax_amount = 0
+	for slab in tax_slab.slabs:
+		cond = cstr(slab.condition).strip()
+		if cond and not eval_tax_slab_condition(cond, eval_globals, eval_locals):
+			continue
+
+		if taxable_earning >= slab.from_amount and (not slab.to_amount or taxable_earning <= slab.to_amount):
+			tax_amount = taxable_earning * slab.percent_deduction * 0.01
+			break  
+
+	return tax_amount
 
 def eval_tax_slab_condition(condition, eval_globals=None, eval_locals=None):
 	if not eval_globals:

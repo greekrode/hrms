@@ -83,6 +83,7 @@
   "column_break_0rsw",
   "non_taxable_earnings",
   "standard_tax_exemption_amount",
+  "position_allowance",
   "tax_exemption_declaration",
   "deductions_before_tax_calculation",
   "annual_taxable_amount",
@@ -631,6 +632,13 @@
    "label": "Tax Exemption Declaration",
    "options": "currency",
    "read_only": 1
+  },
+  {
+    "fieldname": "position_allowance",
+    "fieldtype": "Currency",
+    "label": "Position Allowance (Biaya Jabatan)",
+    "options": "currency",
+    "read_only": 1
   },
   {
    "fieldname": "standard_tax_exemption_amount",

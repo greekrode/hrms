@@ -4,6 +4,7 @@
 import json
 
 from dateutil.relativedelta import relativedelta
+from collections import defaultdict
 
 import frappe
 from frappe import _
@@ -535,6 +536,7 @@ class PayrollEntry(Document):
 			accounts = []
 			currencies = []
 			payable_amount = 0
+			bpjstk_payable_amount = 0
 			accounting_dimensions = get_accounting_dimensions() or []
 			company_currency = erpnext.get_company_currency(self.company)
 
@@ -558,6 +560,19 @@ class PayrollEntry(Document):
 				payable_amount,
 			)
 
+			income_tax_payable_amount = self.get_payable_amount_for_income_tax(
+				deductions,
+                income_tax_payable_amount
+            )
+
+			bpjstk_payable_amount, bpjstk_non_payable_amount = self.get_payable_amount_for_bpjstk(
+                earnings,
+                deductions,
+                bpjstk_payable_amount
+            )
+
+			payable_amount = payable_amount - income_tax_payable_amount - bpjstk_payable_amount 	
+
 			self.set_payable_amount_against_payroll_payable_account(
 				accounts,
 				currencies,
@@ -568,6 +583,29 @@ class PayrollEntry(Document):
 				self.payroll_payable_account,
 				employee_wise_accounting_enabled,
 			)
+
+			self.set_payable_amount_against_income_tax_payable_account(
+                accounts,
+                currencies,
+                company_currency,
+                accounting_dimensions,
+                precision,
+                income_tax_payable_amount,
+                employee_wise_accounting_enabled,
+            )
+
+			bpjstk_payable_amount = bpjstk_payable_amount - bpjstk_non_payable_amount
+
+			self.set_payable_amount_against_bpjstk_payable_account(
+                accounts,
+                currencies,
+                company_currency,
+                accounting_dimensions,
+                precision,
+                bpjstk_payable_amount,
+                employee_wise_accounting_enabled,
+            )
+
 
 			self.make_journal_entry(
 				accounts,
@@ -601,6 +639,8 @@ class PayrollEntry(Document):
 		journal_entry.company = self.company
 		journal_entry.posting_date = self.posting_date
 
+		accounts = merge_accounts(accounts, voucher_type)
+
 		journal_entry.set("accounts", accounts)
 		journal_entry.multi_currency = multi_currency
 
@@ -624,47 +664,255 @@ class PayrollEntry(Document):
 			raise
 
 	def get_payable_amount_for_earnings_and_deductions(
-		self,
-		accounts,
-		earnings,
-		deductions,
-		currencies,
-		company_currency,
-		accounting_dimensions,
-		precision,
-		payable_amount,
+            self,
+            accounts,
+            earnings,
+            deductions,
+            currencies,
+            company_currency,
+            accounting_dimensions,
+			precision,
+			payable_amount,
 	):
 		# Earnings
 		for acc_cc, amount in earnings.items():
 			payable_amount = self.get_accounting_entries_and_payable_amount(
 				acc_cc[0],
 				acc_cc[1] or self.cost_center,
-				amount,
-				currencies,
-				company_currency,
-				payable_amount,
-				accounting_dimensions,
-				precision,
-				entry_type="debit",
-				accounts=accounts,
-			)
+                amount,
+                currencies,
+                company_currency,
+                payable_amount,
+                accounting_dimensions,
+                precision,
+                entry_type='debit',
+                accounts=accounts,
+            )
 
-		# Deductions
+        # Deductions
 		for acc_cc, amount in deductions.items():
-			payable_amount = self.get_accounting_entries_and_payable_amount(
-				acc_cc[0],
-				acc_cc[1] or self.cost_center,
-				amount,
-				currencies,
-				company_currency,
-				payable_amount,
-				accounting_dimensions,
-				precision,
-				entry_type="credit",
-				accounts=accounts,
-			)
+			if acc_cc[0] == '110303 - Piutang Karyawan - VIT':
+				salary_slips = self.get_sal_slip_list(
+					ss_status=1, as_dict=True)
+
+				ss = frappe.qb.DocType("Salary Slip")
+				ssd = frappe.qb.DocType("Salary Detail")
+				salary_components = (
+					frappe.qb.from_(ss)
+                    .join(ssd)
+                    .on(ss.name == ssd.parent)
+                    .select(
+                        ssd.amount,
+                        ss.employee,
+                    )
+                    .where((ssd.parentfield == 'deductions') &
+                           (~ssd.salary_component.like('%Income Tax%')) &
+                           (~ssd.salary_component.like('%Tax%')) &
+                           (~ssd.salary_component.like('%PPh 21%')) &
+                           (~ssd.salary_component.like('%PPh21%')) &
+                           (~ssd.salary_component.like('%BPJS%')) &
+                           (ss.name.isin([d.name for d in salary_slips])))
+                ).run(as_dict=True)
+
+				for d in salary_components:
+					payable_amount = self.get_accounting_entries_and_payable_amount(
+						acc_cc[0],
+                        acc_cc[1] or self.cost_center,
+                        d.amount,
+                        currencies,
+                        company_currency,
+                        payable_amount,
+                        accounting_dimensions,
+                        precision,
+                        entry_type="credit",
+                        accounts=accounts,
+                        party=d.employee,
+                    )
+			elif acc_cc[0] == '210406 - Hutang BPJS Ketenagakerjaan - VIT':
+				payable_amount = self.get_accounting_entries_and_payable_amount(
+                    acc_cc[0],
+                    acc_cc[1] or self.cost_center,
+                    amount,
+                    currencies,
+                    company_currency,
+                    payable_amount,
+                    accounting_dimensions,
+                    precision,
+                    entry_type="credit",
+                    accounts=accounts,
+                )
+			elif acc_cc[0] != '210501 - Hutang PPh 21 - VIT':
+				payable_amount = self.get_accounting_entries_and_payable_amount(
+                    acc_cc[0],
+                    acc_cc[1] or self.cost_center,
+                    amount,
+                    currencies,
+                    company_currency,
+                    payable_amount,
+                    accounting_dimensions,
+                    precision,
+                    entry_type="credit",
+                    accounts=accounts,
+                )
 
 		return payable_amount
+
+	def get_payable_amount_for_income_tax(
+            self,
+            deductions,
+            income_tax_payable_amount,
+	):
+		# Deductions
+		for acc_cc, amount in deductions.items():
+			if acc_cc[0] == '210501 - Hutang PPh 21 - VIT':
+				income_tax_payable_amount += amount
+		return abs(income_tax_payable_amount)
+
+	def get_payable_amount_for_bpjstk(
+            self,
+            earnings,
+            deductions,
+            bpjstk_payable_amount
+	):
+		bpjstk_non_payable_amount = 0
+
+		default_company = frappe.defaults.get_user_default("Company")
+
+		bpjstk_payable_account = frappe.get_cached_value(
+			"Company", default_company, "default_bpjstk_payable_account"
+		)
+
+		bpjstk_expense_account = frappe.get_cached_value(
+			"Company", default_company, "default_bpjstk_expense_account"
+		)
+
+		for acc_cc, amount in earnings.items():
+			if acc_cc[0] == bpjstk_expense_account:
+				bpjstk_payable_amount += amount
+
+		for acc_cc, amount in deductions.items():
+			if acc_cc[0] == bpjstk_payable_account:
+				bpjstk_payable_amount += amount
+				bpjstk_non_payable_amount += amount
+
+		return abs(bpjstk_payable_amount), abs(bpjstk_non_payable_amount)
+
+	def set_payable_amount_against_income_tax_payable_account(
+            self,
+            accounts,
+            currencies,
+            company_currency,
+            accounting_dimensions,
+            precision,
+            income_tax_payable_amount,
+            employee_wise_accounting_enabled,
+    ):
+		default_company = frappe.defaults.get_user_default("Company")
+
+		income_tax_payable_account = frappe.get_cached_value(
+			"Company", default_company, "default_income_tax_payable_account"
+		)
+        # Payable amount
+		if employee_wise_accounting_enabled:
+			"""
+			employee_based_payroll_payable_entries = {
+						'HREMP00004': {
+										'earnings': 83332.0,
+										'deductions': 2000.0
+						},
+						'HREMP00005': {
+										'earnings': 50000.0,
+										'deductions': 2000.0
+						}
+			}
+			"""
+
+			for employee, employee_details in self.employee_based_payroll_payable_entries.items():
+				income_tax_payable_amount = self.get_accounting_entries_and_payable_amount(
+                    income_tax_payable_account,
+                    self.cost_center,
+                    income_tax_payable_amount,
+                    currencies,
+                    company_currency,
+                    0,
+                    accounting_dimensions,
+                    precision,
+                    entry_type="payable",
+                    party=employee,
+                    accounts=accounts,
+                )
+		else:
+			income_tax_payable_amount = self.get_accounting_entries_and_payable_amount(
+				income_tax_payable_account,
+				self.cost_center,
+                income_tax_payable_amount,
+                currencies,
+                company_currency,
+                0,
+                accounting_dimensions,
+                precision,
+                entry_type="payable",
+                accounts=accounts,
+            )
+
+	def set_payable_amount_against_bpjstk_payable_account(
+            self,
+            accounts,
+            currencies,
+            company_currency,
+            accounting_dimensions,
+            precision,
+            bpjstk_payable_amount,
+            employee_wise_accounting_enabled,
+    ):
+		default_company = frappe.defaults.get_user_default("Company")
+
+		bpjstk_payable_account = frappe.get_cached_value(
+			"Company", default_company, "default_bpjstk_payable_account"
+		)
+        # Payable amount
+		if employee_wise_accounting_enabled:
+			"""
+            employee_based_payroll_payable_entries = {
+                            'HREMP00004': {
+                                            'earnings': 83332.0,
+                                            'deductions': 2000.0
+                            },
+                            'HREMP00005': {
+                                            'earnings': 50000.0,
+                                            'deductions': 2000.0
+                            }
+            }
+            """
+
+			for employee, employee_details in self.employee_based_payroll_payable_entries.items():
+				bpjstk_payable_amount = self.get_accounting_entries_and_payable_amount(
+					bpjstk_payable_account,
+                    self.cost_center,
+                    bpjstk_payable_amount,
+                    currencies,
+                    company_currency,
+                    0,
+                    accounting_dimensions,
+                    precision,
+                    entry_type="payable",
+                    party=employee,
+                    accounts=accounts,
+                )
+		else:
+			bpjstk_payable_amount = self.get_accounting_entries_and_payable_amount(
+				bpjstk_payable_account,
+                self.cost_center,
+                bpjstk_payable_amount,
+                currencies,
+                company_currency,
+                0,
+                accounting_dimensions,
+                precision,
+                entry_type="payable",
+                accounts=accounts,
+            )
+
 
 	def set_payable_amount_against_payroll_payable_account(
 		self,
@@ -830,60 +1078,82 @@ class PayrollEntry(Document):
 		)
 
 		salary_slip_total = 0
+		income_tax_total = 0
+		bpjstk_total = 0
+		bpjstk_non_payable_total = 0
 		salary_slips = self.get_salary_slip_details()
 
 		for salary_detail in salary_slips:
 			if salary_detail.parentfield == "earnings":
 				(
-					is_flexible_benefit,
-					only_tax_impact,
-					create_separate_je,
-					statistical_component,
-				) = frappe.db.get_value(
-					"Salary Component",
-					salary_detail.salary_component,
-					(
-						"is_flexible_benefit",
-						"only_tax_impact",
-						"create_separate_payment_entry_against_benefit_claim",
-						"statistical_component",
-					),
-					cache=True,
-				)
-
+                    is_flexible_benefit,
+                    only_tax_impact,
+                    create_separate_je,
+                    statistical_component,
+                ) = frappe.db.get_value(
+                    "Salary Component",
+                    salary_detail.salary_component,
+                    (
+                        "is_flexible_benefit",
+                        "only_tax_impact",
+                        "create_separate_payment_entry_against_benefit_claim",
+                        "statistical_component",
+                    ),
+                    cache=True,
+                )
+				
 				if only_tax_impact != 1 and statistical_component != 1:
 					if is_flexible_benefit == 1 and create_separate_je == 1:
 						self.set_accounting_entries_for_bank_entry(
 							salary_detail.amount, salary_detail.salary_component
-						)
+                        )
 					else:
 						if employee_wise_accounting_enabled:
 							self.set_employee_based_payroll_payable_entries(
 								"earnings",
-								salary_detail.employee,
-								salary_detail.amount,
+                                salary_detail.employee,
+                                salary_detail.amount,
+                                salary_detail.salary_structure,
+                            )
+						if 'BPJSTK' in salary_detail.salary_component:
+							bpjstk_total += salary_detail.amount
+							bpjstk_non_payable_total += salary_detail.amount
+						else: 
+							salary_slip_total += salary_detail.amount
+
+				if salary_detail.parentfield == "deductions":
+					statistical_component = frappe.db.get_value(
+						"Salary Component", salary_detail.salary_component, "statistical_component", cache=True
+                    )
+
+					if not statistical_component:
+						if employee_wise_accounting_enabled:
+							self.set_employee_based_payroll_payable_entries(
+								"deductions",
+                                salary_detail.employee,
+                                salary_detail.amount,
 								salary_detail.salary_structure,
 							)
-						salary_slip_total += salary_detail.amount
-
-			if salary_detail.parentfield == "deductions":
-				statistical_component = frappe.db.get_value(
-					"Salary Component", salary_detail.salary_component, "statistical_component", cache=True
-				)
-
-				if not statistical_component:
-					if employee_wise_accounting_enabled:
-						self.set_employee_based_payroll_payable_entries(
-							"deductions",
-							salary_detail.employee,
-							salary_detail.amount,
-							salary_detail.salary_structure,
-						)
-
-					salary_slip_total -= salary_detail.amount
+					elif 'BPJSTK' in salary_detail.salary_component:
+						bpjstk_total += salary_detail.amount
+					elif 'Income Tax' in salary_detail.salary_component or 'Tax' in salary_detail.salary_component or 'PPh 21' in salary_detail.salary_component or 'PPh 21' in salary_detail.salary_component:
+						income_tax_total += salary_detail.amount
+					else:
+						salary_slip_total -= salary_detail.amount
+        
+		salary_slip_total = salary_slip_total - bpjstk_total - income_tax_total + bpjstk_non_payable_total
 
 		if salary_slip_total > 0:
-			self.set_accounting_entries_for_bank_entry(salary_slip_total, "salary")
+			self.set_accounting_entries_for_bank_entry(
+				salary_slip_total, "salary")
+
+		if income_tax_total > 0:
+			self.set_accounting_entries_for_bank_entry(
+				income_tax_total, "income tax")
+
+		if bpjstk_total > 0:
+			self.set_accounting_entries_for_bank_entry(
+				bpjstk_total, "BPJSTK")
 
 	def get_salary_slip_details(self):
 		SalarySlip = frappe.qb.DocType("Salary Slip")
@@ -911,6 +1181,20 @@ class PayrollEntry(Document):
 
 	def set_accounting_entries_for_bank_entry(self, je_payment_amount, user_remark):
 		payroll_payable_account = self.payroll_payable_account
+
+		default_company = frappe.defaults.get_user_default("Company")
+
+		if user_remark == "income tax":
+			income_tax_payable_account = frappe.get_cached_value(
+				"Company", default_company, "default_income_tax_payable_account"
+			)
+			payroll_payable_account = income_tax_payable_account
+		if user_remark == "BPJSTK":
+			bpjstk_expense_account = frappe.get_cached_value(
+				"Company", default_company, "default_bpjstk_expense_account"
+			)
+			payroll_payable_account = bpjstk_expense_account
+
 		precision = frappe.get_precision("Journal Entry Account", "debit_in_account_currency")
 
 		accounts = []
@@ -1566,3 +1850,60 @@ def employee_query(doctype, txt, searchfield, start, page_len, filters):
 	)
 
 	return employee_list
+
+def merge_accounts(accounts, voucher_type):
+    if voucher_type != 'Journal Entry':
+        return accounts
+    
+    default_company = frappe.defaults.get_user_default("Company")
+
+    bpjstk_payable_account = frappe.get_cached_value(
+        "Company", default_company, "default_bpjstk_payable_account"
+    )
+
+    special_account = bpjstk_payable_account
+    merged = defaultdict(lambda: {
+        'debit_in_account_currency': 0,
+        'credit_in_account_currency': 0,
+        'exchange_rate': None,
+        'cost_center': None,
+        'project': '',
+        'reference_type': None,
+        'reference_name': None
+    })
+
+    for account in accounts:
+        key = account['account']
+        current = merged[key]
+
+        current['account'] = key
+        current['exchange_rate'] = account['exchange_rate']
+        current['cost_center'] = account['cost_center']
+        current['project'] = account.get('project', '')
+        current['party_type'] = account.get('party_type', '')
+        current['party'] = account.get('party', '')
+
+        if key == special_account:
+            current['credit_in_account_currency'] += account.get('credit_in_account_currency', 0)
+            current['debit_in_account_currency'] = 0
+        else:
+            current['debit_in_account_currency'] += account.get('debit_in_account_currency', 0)
+            current['credit_in_account_currency'] += account.get('credit_in_account_currency', 0)
+
+        for field in ['reference_type', 'reference_name']:
+            if field in account:
+                current[field] = account[field]
+
+    result = [
+        {k: v for k, v in account.items() if v not in (0, None, '')}
+        for account in merged.values()
+        if account['debit_in_account_currency'] != 0 or account['credit_in_account_currency'] != 0
+    ]
+
+    result.sort(key=lambda x: (
+        -1 if x.get('debit_in_account_currency', 0) > 0 else 1,
+        1 if x.get('credit_in_account_currency', 0) > 0 else -1,
+        x['account']
+    ))
+
+    return result
